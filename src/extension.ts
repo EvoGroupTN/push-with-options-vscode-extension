@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
+import { exec } from 'child_process';
 
 const readFileAsync = promisify(fs.readFile);
 
@@ -99,43 +100,60 @@ export async function activate(context: vscode.ExtensionContext) {
             // Convert any -o to --push-option= for consistency
             pushOptions = pushOptions.replace(/\s+-o\s+/g, ' --push-option=');
 
-            // Get the actual branch name
-            const actualBranch = repo.state.HEAD?.name;
-            if (!actualBranch) {
-                throw new Error('Unable to determine current branch');
-            }
-
-            let forceMode: vscode.ForcePushMode | undefined = undefined;
-            const unsupportedOptions: string[] = [];
-            const optionsArray = pushOptions.split(' ').filter(opt => opt.trim() !== '');
-
-            for (const opt of optionsArray) {
-                if (opt === "--force") {
-                    forceMode = vscode.ForcePushMode.Force;
-                } else if (opt === "--force-with-lease") {
-                    forceMode = vscode.ForcePushMode.ForceWithLease;
-                } else {
-                    unsupportedOptions.push(opt);
+            let command: string;
+            if (pushOptions.toLowerCase().startsWith('git push ')) {
+                command = pushOptions;
+            } else {
+                const remote = repo.state.remotes[0]?.name || 'origin'; // Use first remote or default to 'origin'
+                const currentBranch = repo.state.HEAD?.name;
+                if (!currentBranch) {
+                    // This check is vital if not using a full user-provided command
+                    throw new Error('Unable to determine current branch for push command');
                 }
+                // Ensure pushOptions is included only if it's not empty, to avoid extra spaces
+                command = `git push ${remote} ${currentBranch} ${pushOptions ? pushOptions : ''}`.trim();
             }
 
             // Show progress during push
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
                 title: "Pushing to remote...",
-                cancellable: false
-            }, async () => {
-                try {
-                    // Use the Git extension's push functionality which handles credentials
-                    await repo.push(undefined, actualBranch, undefined, forceMode);
-                    vscode.window.showInformationMessage(`Successfully pushed to ${actualBranch}`);
-                    if (unsupportedOptions.length > 0) {
-                        vscode.window.showWarningMessage(`The following push options are not supported by this command and were ignored: ${unsupportedOptions.join(' ')}`);
-                    }
-                } catch (error) {
-                    throw new Error(`Git push failed: ${error instanceof Error ? error.message : String(error)}`);
-                }
+                cancellable: false // TODO: Consider making this true and handling cancellation
+            }, async () => { // Naming 'progress' and 'token' is conventional but not used here yet
+                return new Promise<void>((resolve, reject) => {
+                    // Execute the git push command. This will use the system's configured Git credential helper.
+                    exec(command, { cwd: repo.rootUri.fsPath }, (error, stdout, stderr) => {
+                        if (error) {
+                            let errorMessage = `Git push failed: ${error.message}`;
+                            if (stderr) {
+                                errorMessage += `\nStderr: ${stderr.trim()}`;
+                            }
+                            vscode.window.showErrorMessage(errorMessage);
+                            reject(new Error(errorMessage)); // Reject the promise for withProgress
+                            return;
+                        }
+
+                        if (stderr && (stderr.toLowerCase().includes('error:') || stderr.toLowerCase().includes('fatal:'))) {
+                            vscode.window.showErrorMessage(`Git push failed (reported via stderr): ${stderr.trim()}`);
+                            reject(new Error(stderr.trim()));
+                            return;
+                        }
+
+                        let successMessage = 'Git push command completed.';
+                        // Git push often sends its primary output (even success) to stderr.
+                        // Stdout is often empty or used for specific data transfer phases.
+                        const outputToShow = stderr || stdout; // Prefer stderr if it has content.
+                        if (outputToShow && outputToShow.trim().length > 0) {
+                            successMessage += `\nOutput:\n${outputToShow.trim()}`;
+                        }
+                        vscode.window.showInformationMessage(successMessage);
+                        resolve(); // Resolve the promise for withProgress
+                    });
+                });
             });
+            // Note: The old success message `vscode.window.showInformationMessage(\`Successfully pushed to ${branch}\`)`
+            // and the warning for unsupported options are removed.
+            // The main try...catch block around withProgress will catch rejections from the Promise.
         } catch (error) {
             vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
         }
