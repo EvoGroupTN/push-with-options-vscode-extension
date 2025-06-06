@@ -99,6 +99,26 @@ export async function activate(context: vscode.ExtensionContext) {
             // Convert any -o to --push-option= for consistency
             pushOptions = pushOptions.replace(/\s+-o\s+/g, ' --push-option=');
 
+            // Get the actual branch name
+            const actualBranch = repo.state.HEAD?.name;
+            if (!actualBranch) {
+                throw new Error('Unable to determine current branch');
+            }
+
+            let forceMode: vscode.ForcePushMode | undefined = undefined;
+            const unsupportedOptions: string[] = [];
+            const optionsArray = pushOptions.split(' ').filter(opt => opt.trim() !== '');
+
+            for (const opt of optionsArray) {
+                if (opt === "--force") {
+                    forceMode = vscode.ForcePushMode.Force;
+                } else if (opt === "--force-with-lease") {
+                    forceMode = vscode.ForcePushMode.ForceWithLease;
+                } else {
+                    unsupportedOptions.push(opt);
+                }
+            }
+
             // Show progress during push
             await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
@@ -107,8 +127,11 @@ export async function activate(context: vscode.ExtensionContext) {
             }, async () => {
                 try {
                     // Use the Git extension's push functionality which handles credentials
-                    await repo.push(undefined, pushOptions.split(' '));
-                    vscode.window.showInformationMessage(`Successfully pushed to ${branch}`);
+                    await repo.push(undefined, actualBranch, undefined, forceMode);
+                    vscode.window.showInformationMessage(`Successfully pushed to ${actualBranch}`);
+                    if (unsupportedOptions.length > 0) {
+                        vscode.window.showWarningMessage(`The following push options are not supported by this command and were ignored: ${unsupportedOptions.join(' ')}`);
+                    }
                 } catch (error) {
                     throw new Error(`Git push failed: ${error instanceof Error ? error.message : String(error)}`);
                 }
