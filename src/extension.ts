@@ -2,12 +2,16 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
+import { execFile } from 'child_process';
 
 const readFileAsync = promisify(fs.readFile);
+const execFileAsync = promisify(execFile);
 
 export interface GitPushOptions {
     pushOptions: string[];
     force?: boolean;
+    noVerify?: boolean;
+    clientFlags?: string[];
 }
 
 function unquote(str: string): string {
@@ -60,7 +64,9 @@ function tokenizeInput(input: string): string[] {
 
 export function parsePushOptions(rawInputs: string[]): GitPushOptions {
     const pushOptions: string[] = [];
+    const clientFlags: string[] = [];
     let force: boolean | undefined = undefined;
+    let noVerify: boolean | undefined = undefined;
 
     for (const input of rawInputs) {
         if (!input || !input.trim()) {
@@ -80,6 +86,15 @@ export function parsePushOptions(rawInputs: string[]): GitPushOptions {
 
             if (token === '--force' || token === '--force-with-lease' || token === '-f') {
                 force = true;
+                if (!clientFlags.includes(token)) {
+                    clientFlags.push(token);
+                }
+                i++;
+            } else if (token === '--no-verify') {
+                noVerify = true;
+                if (!clientFlags.includes('--no-verify')) {
+                    clientFlags.push('--no-verify');
+                }
                 i++;
             } else if (token.startsWith('--push-option=')) {
                 const val = token.substring('--push-option='.length);
@@ -113,6 +128,11 @@ export function parsePushOptions(rawInputs: string[]): GitPushOptions {
                     pushOptions.push(unquote(val));
                 }
                 i++;
+            } else if (token.startsWith('-')) {
+                if (!clientFlags.includes(token)) {
+                    clientFlags.push(token);
+                }
+                i++;
             } else {
                 pushOptions.push(unquote(token));
                 i++;
@@ -124,7 +144,106 @@ export function parsePushOptions(rawInputs: string[]): GitPushOptions {
     if (force !== undefined) {
         result.force = force;
     }
+    if (noVerify !== undefined) {
+        result.noVerify = noVerify;
+    }
+    if (clientFlags.length > 0) {
+        result.clientFlags = clientFlags;
+    }
     return result;
+}
+
+export function buildPushArgs(
+    options: GitPushOptions,
+    remote?: string,
+    branch?: string
+): string[] {
+    const args: string[] = ['push'];
+
+    if (remote) {
+        args.push(remote);
+    }
+    if (branch) {
+        args.push(branch);
+    }
+
+    if (options.noVerify) {
+        args.push('--no-verify');
+    }
+
+    if (options.force) {
+        args.push('--force-with-lease');
+    }
+
+    if (options.clientFlags) {
+        for (const flag of options.clientFlags) {
+            if (
+                flag !== '--no-verify' &&
+                flag !== '--force' &&
+                flag !== '--force-with-lease' &&
+                flag !== '-f'
+            ) {
+                args.push(flag);
+            }
+        }
+    }
+
+    if (options.pushOptions) {
+        for (const opt of options.pushOptions) {
+            args.push('-o', opt);
+        }
+    }
+
+    return args;
+}
+
+export async function pushWithGitCli(
+    repo: any,
+    api: any,
+    options: GitPushOptions,
+    remote?: string,
+    branch?: string
+): Promise<void> {
+    const gitPath = api?.git?.path || 'git';
+    const cwd = repo.rootUri.fsPath;
+    const args = buildPushArgs(options, remote, branch);
+
+    await execFileAsync(gitPath, args, { cwd, env: process.env });
+}
+
+export async function executePush(
+    repo: any,
+    api: any,
+    options: GitPushOptions
+): Promise<void> {
+    const branch = repo.state.HEAD?.name;
+    const remote = repo.state.HEAD?.upstream?.remote || 'origin';
+
+    const hasUnexpressibleClientFlags =
+        options.noVerify ||
+        (options.clientFlags &&
+            options.clientFlags.some(
+                flag => flag !== '--force' && flag !== '--force-with-lease' && flag !== '-f'
+            ));
+
+    if (hasUnexpressibleClientFlags) {
+        await pushWithGitCli(repo, api, options, remote, branch);
+        return;
+    }
+
+    try {
+        const vscodePushOptions: { pushOptions?: string[]; force?: boolean } = {};
+        if (options.pushOptions && options.pushOptions.length > 0) {
+            vscodePushOptions.pushOptions = options.pushOptions;
+        }
+        if (options.force !== undefined) {
+            vscodePushOptions.force = options.force;
+        }
+
+        await repo.push(remote, undefined, false, vscodePushOptions);
+    } catch (apiError) {
+        await pushWithGitCli(repo, api, options, remote, branch);
+    }
 }
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -239,8 +358,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 cancellable: false
             }, async () => {
                 try {
-                    // Use the Git extension's push functionality which handles credentials
-                    await repo.push(undefined, undefined, parsedPushOptions);
+                    await executePush(repo, api, parsedPushOptions);
                     vscode.window.showInformationMessage(`Successfully pushed to ${branch}`);
                 } catch (error) {
                     throw new Error(`Git push failed: ${error instanceof Error ? error.message : String(error)}`);
